@@ -18,7 +18,8 @@ use this module to access it:
   $tuner->power(1);
   $tuner->channel(184); # tune in the preview channel
 
-This alpha release is not feature complete.  Please expect (possibly code breaking) changes.
+This alpha release is not feature complete.  Please expect (possibly code breaking) changes.  Any 
+such changes will be documented in the CHANGES file.
 
 INSTALLATION
 

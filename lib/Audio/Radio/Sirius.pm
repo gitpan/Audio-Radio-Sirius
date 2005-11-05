@@ -6,6 +6,7 @@ use warnings;
 use strict;
 
 use Carp;
+use Time::HiRes qw(sleep); # need to sleep for milliseconds in some receive loops
 
 =head1 NAME
 
@@ -13,11 +14,11 @@ Audio::Radio::Sirius - Control a Sirius satellite radio tuner
 
 =head1 VERSION
 
-Version 0.01
+Version 0.02
 
 =cut
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 our $AUTOLOAD;
 
 our %DEFAULTS = (
@@ -31,7 +32,11 @@ our %DEFAULTS = (
 	_sequence	=> 0,
 	_serial	=> undef,
 	_lastack	=> -1,
-	_lastreq	=> -1
+	_lastreq	=> -1,
+	_callbacks	=> {
+		'channel_update'	=> undef,
+	},
+	_buffer	=> '',
 );
 
 our %SETTABLE = (
@@ -90,14 +95,25 @@ our %UPDATES = (
 		handler	=> \&_channel_item_update,
 		removefirst	=> 2
 	},
+	'8002'	=> {
+		# The way verbosity works now, we won't see PID info.  Verbosity must not include channel updates or it only sends those
+		# (mostly because PIDs are part of channel updates).
+		name		=> 'pid_info',
+		handler	=> undef,
+	},
 	'8003'	=> {
 		name		=> 'time_info',
 		handler	=> \&_time_update,
 		removefirst	=> 2
 	},
 	'8004'	=> {
+		# 1 1 0 - acquiring signal
+		# 1 0 0 - all's well
+		# 2 1 0 - antenna disconnected
+		# 2 0 1 - antenna back
 		name		=> 'tuner_info',
-		handler	=> undef
+		handler	=> undef,
+		removefirst	=> 2
 	},
 	'8005'	=> {
 		name		=> 'signal_info',
@@ -213,20 +229,24 @@ sub connect {
 		$connection->databits(8);
 		$connection->stopbits(1);
 		$connection->handshake('none');
-		$connection->read_const_time(150);
-		$connection->read_interval(50);
-		$connection->read_char_time(10);
-		$connection->write_char_time(10);
+#		$connection->read_const_time(150);
+#		$connection->read_interval(50);
+#		$connection->read_char_time(10);
+#		$connection->write_char_time(10);
+		$connection->read_const_time(1000);
+#		$connection->read_interval(5);
+		$connection->read_char_time(50);
+		$connection->write_char_time(0);
 		if (!$connection->write_settings) {
 			carp "Couldn't open connection: $_";
 			return 0;
 		}
 		$self->{_serial} = $connection;
-		$self->_send_command($COMMANDS{'reset'});
-		if ( !$self->_send_command($COMMANDS{'poweroff'}) ) {
-			carp "Tuner didn't respond to poweroff command";
-			return 0;
-		}
+#		$self->_send_command($COMMANDS{'reset'});
+#		if ( !$self->_send_command($COMMANDS{'poweroff'}) ) {
+#			carp "Tuner didn't respond to poweroff command";
+#			return 0;
+#		}
 		$self->{connected} = 1; # we're live
 		return 1;
 	} else {
@@ -248,22 +268,27 @@ sub power {
 	if (!ref($self)) { croak "$self isn't an object"; }
 	my ($powerreq) = @_;
 
+	if (!defined($powerreq)) { return $self->{'power'}; }
 	if ($powerreq == 1) {
 		my $current_gain = $self->{gain};
 		my $current_mute = $self->{mute};
 		if (!(
+			$self->_send_command($COMMANDS{'reset'}) &&
+			$self->_send_command($COMMANDS{'poweroff'}) &&
 			$self->_send_command($COMMANDS{'poweron'}) &&
 #			$self->_send_command('000c0000001700') && #useless
 			$self->gain($current_gain) &&
 			$self->_send_command($COMMANDS{'request_signal'}) &&
 			$self->_send_command($COMMANDS{'request_sid'}) &&
 			$self->mute($current_mute)
+#			$self->{'power'} = 1
 		)) {
 			carp "Error - tuner failed to respond to power-up sequence.";
 			return 0;
 		}
 	} else {
-		# turn it off.
+		$self->_send_command($COMMANDS{'poweroff'});
+		$self->{'power'} = 0;
 	}
 }
 
@@ -393,10 +418,51 @@ sub monitor {
 	my ($spins) = @_;
 
 	if (!defined($spins)) { $spins = 1; }
+	$spins = $spins * 20;
 	foreach (1..$spins) {
 		$self->_receive_if_waiting;
-		sleep (1); # chill 1 second
+		sleep (.05); # chill .05 second
 	}
+}
+
+=head2 set_callback (callback type, function reference)
+
+When the tuner sends an update, such as new artist/title information on the current channel, it may be helpful to execute some code which handles this
+event.  To accomidate this, you may define function callbacks activated when each event occurs.  Note that some of the parameters below are marked with 
+an asterisk.  This indicates that they may be undefined when your function is called.  You should account for this in your callback function.
+
+=head3 channel_update (channel, *pid, *artist, *title, *composer)
+
+ $tuner->set_callback ('channel_update', \&channel);
+
+ sub channel {
+	my ($channel, $pid, $artist, $title, $composer) = @_;
+	print "Channel $channel is now playing $title.\n";
+ }
+
+=head3 signal_update
+
+Not yet implemented.
+
+=head3 time_update
+
+Not yet implemented.
+
+=head3 status_update
+
+Not yet implemented.
+
+=cut
+
+sub set_callback {
+	my $self = shift;
+	if (!ref($self) eq 'CODE') { croak "$self isn't an object"; }
+	my ($reqtype, $funcref) = @_;
+	if (!ref $funcref) { croak "$funcref must be a reference to a function"; }
+	if (!exists($DEFAULTS{'_callbacks'}{$reqtype}) ) { croak "$reqtype is not a supported update type"; }
+	# validated enough for 'ya??
+
+	$self->{'_callbacks'}{$reqtype} = $funcref;
 }
 
 =head2 verbosity (level)
@@ -454,13 +520,68 @@ sub verbosity {
 	}
 }
 
+sub _read {
+	# _read works like read from $serial.  except better.
+	# returns ($count, $data)
+	# the tests for > 200000 check for the get_tick_count function wrapping
+	# (happens every 43 days or something)
+	my $self = shift;
+	my ($count) = @_;
+	my $debug = $self->{debug};
+	my $serial = $self->{_serial};
+	my $buffer = $self->{_buffer};
+	my $buffer_count = length($buffer);
+
+	my $data = '';
+	my $data_count = 0;
+
+	my $timeout = 100;
+	my $start_ticks = $serial->get_tick_count;
+	my $end_ticks = $start_ticks + $timeout;
+	WAIT: while ( (($serial->status)[1] == 0) && ($buffer_count==0) ) { # loop while nothing is waiting
+		if (($serial->get_tick_count > $end_ticks) || (($end_ticks - $serial->get_tick_count) > 200000)) {
+			# last WAIT;
+			return 0, $data; 
+		}
+		sleep .005;
+		#print "hi $buffer_count\n";
+	}
+
+	# READ: while (($serial->status)[1] > 0) { # loop while data is waiting
+	do {
+		my $input = '';
+		if ($buffer_count > 0) {
+			$input = $buffer;
+			$self->{_buffer} = '';
+			$buffer_count = 0;
+		}
+		$input .= $serial->input;
+		my $input_count = length($input);
+		if ($input_count > 0) {
+			$data .= $input;
+			$data_count += $input_count;
+			$end_ticks += 6; # bonus delay because we got something
+		}
+		sleep .001;
+		#print "$data_count: $count\n";
+	} until (($data_count >= $count) || ($serial->get_tick_count > $end_ticks) || 
+		(($end_ticks - $serial->get_tick_count) > 200000)); 
+
+	if ($data_count > $count) {
+		$self->{_buffer} = substr($data, $count);
+		return $count, substr($data, 0, $count);
+	}
+	#print "returning: $data\n";
+	return $data_count, $data;
+}
+
 sub _receive_if_waiting {
 	my $self = shift;
 	if (!ref($self)) { croak "$self isn't an object"; }
 
 	my $serial = $self->{_serial};
 	my $waiting = ($serial->status)[1];
-	if (defined($waiting) && $waiting > 0) { $self->_receive; }
+	if (defined($waiting) && $waiting > 6) { $self->_receive; }
 }
 
 sub _receive {
@@ -468,7 +589,8 @@ sub _receive {
 	my $serial = $self->{_serial};
 	my $debug = $self->{debug};
 	READ: while (1) {
-		my ($headercount, $header) = $serial->read(6);
+		#my ($headercount, $header) = $serial->read(6);
+		my ($headercount, $header) = $self->_read(6);
 		last READ if ($headercount == 0);
 		if ($headercount < 6) {
 			if ($debug) { 
@@ -483,7 +605,8 @@ sub _receive {
 		if ($headerescapes) { 
 			# read even more
 			if ($debug) { print "Fixing $headerescapes escape characters in header.\n"; }
-			my ($headercount2, $header2) = $serial->read($headerescapes);
+			#my ($headercount2, $header2) = $serial->read($headerescapes);
+			my ($headercount2, $header2) = $self->_read($headerescapes);
 			next READ if ($headercount2 < $headerescapes); # :(
 			$header .= $header2;
 		}
@@ -495,10 +618,12 @@ sub _receive {
 		# there's a special case that happens if length = 1b (the escape character).  we need to read 1 just to flush it.
 		if ($length == 0x1b) {
 			if ($debug) { print "Length 1b.  Flushing 1 character.\n"; }
-			$serial->read(1);
+			#$serial->read(1);
+			$self->_read(1);
 		}
 
-		my ($datacount, $data) = $serial->read($length+1); # read data and checksum
+		#my ($datacount, $data) = $serial->read($length+1); # read data and checksum
+		my ($datacount, $data) = $self->_read($length+1); # read data and checksum
 		next READ if ($datacount < $length + 1); # shouldn't happen
 		# everything was read.
 		# handle the escape character in the data sequence.  must be done before checksum.
@@ -506,7 +631,8 @@ sub _receive {
 		FIXESC: if ($escapecount) { 
 			# read even more
 			if ($debug) { print "Fixing $escapecount escape characters.\n"; }
-			my ($datacount2, $data2) = $serial->read($escapecount);
+			#my ($datacount2, $data2) = $serial->read($escapecount);
+			my ($datacount2, $data2) = $self->_read($escapecount);
 			next READ if ($datacount2 < $escapecount); # :(
 			$data .= $data2;
 			$escapecount = $data =~ s/\x1b\x1b/\x1b/g;
@@ -529,12 +655,14 @@ sub _receive {
 			next READ;
 		}
 
+		# ack it now before we go further.  the tuner is impatient.
+		$self->_send_ack($seq);
+
 		if ($type eq $TYPES{command}) {
 			# did we get this already?
 			if ($seq == $self->{_lastreq}) {
 				# Tuner is repeating itself... This is bad.
 				if ($debug > 2) { print "Not handling duplicate update seq $seq\n"; }
-				$self->_send_ack($seq);
 				next READ;
 			}
 			$self->{_lastreq} = $seq;
@@ -562,7 +690,6 @@ sub _receive {
 					print "Unknown update: $updatetype data: $datahex\n";
 				}
 			}
-			$self->_send_ack($seq);
 		}
 	}
 }
@@ -573,6 +700,9 @@ sub _channel_update {
 	
 	my ($channel, $categorynum, $shortchan, $longchan, $shortcat, $longcat);
 	($channel, $categorynum, $shortchan, $longchan, $shortcat, $longcat, $data) = unpack ('C1xC1xxC1/aC/aC/aC/aa*', $data);
+
+	$self->{channel} = $channel;
+
 	$self->{categories}{$categorynum}{longname} = $longcat;
 	$self->{categories}{$categorynum}{shortname} = $shortcat;
 	$self->{channels}{$channel}{longname} = $longchan;
@@ -583,6 +713,26 @@ sub _channel_update {
 
 	# process left over items
 	$self->_channel_items($channel, $data);
+
+	# call handler
+	$self->_call_channel_handler($channel);
+}
+
+sub _call_channel_handler {
+	my $self = shift;
+	my ($channel) = @_;
+
+	# update handler: ($channel, $pid, $artist, $title, $composer)
+	my $handler = $self->{'_callbacks'}{'channel_update'};
+	if (ref($handler)) {
+		&$handler (
+			$channel,
+			$self->{'channels'}{$channel}{'pid'},
+			$self->{'channels'}{$channel}{'artist'},
+			$self->{'channels'}{$channel}{'title'},
+			$self->{'channels'}{$channel}{'composer'}
+		);
+	}
 }
 
 sub _signal_update {
@@ -619,6 +769,9 @@ sub _channel_item_update {
 	my $channel;
 	($channel, $data) = unpack ('C1a*', $data);
 	$self->_channel_items($channel, $data);
+
+	# call handler
+	$self->_call_channel_handler($channel);
 }
 
 sub _channel_items {
@@ -631,6 +784,12 @@ sub _channel_items {
 	my $numitems;
 	($numitems, $data) = unpack ('C1a*', $data);
 	if ($numitems>0) {
+		# there be items here
+		# step 1 - clean out the old items
+		foreach my $clean (values %ITEM_TYPES) {
+			$self->{channels}{$channel}{$clean} = undef;
+		}
+
 		ITEM: foreach (1..$numitems) {
 			my ($itemtype, $item, $typevar);
 			($itemtype, $item, $data) = unpack ('C1C1/aa*', $data);
@@ -774,7 +933,7 @@ None yet.
 
 =head1 AUTHOR
 
-Jamie Tatum, C<< <jtatum@gmail.com> >>
+Jamie Tatum, L<http://thelightness.blogspot.com>, C<< <jtatum@gmail.com> >>
 
 =head1 BUGS
 
@@ -810,6 +969,9 @@ your bug as I make changes.
 =head1 COPYRIGHT & LICENSE
 
 Copyright 2005 Jamie Tatum, all rights reserved.
+
+Sirius and related marks are trademarks of SIRIUS Satellite Radio Inc.  Use of this module is at your own risk and may be subject to the SIRIUS terms and
+conditions located at L<http://www.sirius.com/serviceterms>.
 
 This program is free software; you can redistribute it and/or modify it
 under the same terms as Perl itself.
