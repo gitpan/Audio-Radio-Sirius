@@ -14,11 +14,11 @@ Audio::Radio::Sirius - Control a Sirius satellite radio tuner
 
 =head1 VERSION
 
-Version 0.02
+Version 0.03
 
 =cut
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 our $AUTOLOAD;
 
 our %DEFAULTS = (
@@ -45,7 +45,7 @@ our %SETTABLE = (
 
 our %COMMANDS = (
 	poweroff		=> '000800',
-	reset			=> '0090',
+	reset			=> '0009',
 	poweron		=> '000803',
 	volume		=> '0002',
 	mute			=> '0003',
@@ -233,10 +233,10 @@ sub connect {
 #		$connection->read_interval(50);
 #		$connection->read_char_time(10);
 #		$connection->write_char_time(10);
-		$connection->read_const_time(1000);
+#		$connection->read_const_time(1000);
 #		$connection->read_interval(5);
-		$connection->read_char_time(50);
-		$connection->write_char_time(0);
+#		$connection->read_char_time(50);
+#		$connection->write_char_time(0);
 		if (!$connection->write_settings) {
 			carp "Couldn't open connection: $_";
 			return 0;
@@ -406,6 +406,9 @@ A monitor cycle will take a minimum of one second.  If data is received, this ti
 The amount of time monitor takes will depend on the C<verbosity> of the tuner.
 
 If no number of cycles is specified, monitor runs one cycle.
+
+B<Note:> As of version 0.02, the cycle parameter is no longer a true count of the number of cycles.  The number specified is multiplied by 20.
+Each cycle now sleeps 50 msec so the result is roughly the same, although this may increase the drift of cycles vs. seconds even more.
 
   $tuner->monitor(5); # spin 5 times
 
@@ -965,6 +968,9 @@ I will be notified, and then you'll automatically be notified of progress on
 your bug as I make changes.
 
 =head1 ACKNOWLEDGEMENTS
+
+Thanks to Mitch and Dale at L<http://rush2112.net> Thanks to everyone who reversed a little bit of the tuner protocol 
+- too many to list. :)  You know who you are.
 
 =head1 COPYRIGHT & LICENSE
 

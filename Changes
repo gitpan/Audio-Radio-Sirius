@@ -1,5 +1,8 @@
 Revision history for Audio-Radio-Sirius
 
+0.03	06-November-2005 11:00 PM
+	Fixed some compatibility issues with Device::SerialPort.
+
 0.02	04-November-2005 11:03 PM
 	Implemented $tuner->set_callback.  Notification is now provided for channel updates.
 	More callbacks to come.

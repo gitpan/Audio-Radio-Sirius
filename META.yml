@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name: Audio-Radio-Sirius
-version: 0.02
+version: 0.03
 author:
   - Jamie Tatum <jtatum@gmail.com>
 abstract: Control a Sirius satellite radio tuner
